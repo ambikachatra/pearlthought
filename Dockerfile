@@ -1,34 +1,20 @@
-# ---- Builder Stage ----
-FROM node:18-alpine AS builder
+# This Dockerfile is for LOCAL DEVELOPMENT ONLY
+
+FROM node:18-alpine
+
+# Set the working directory
 WORKDIR /opt/app
 
+# Copy package manifests and install dependencies
 COPY ./package.json ./package-lock.json ./
-
-# Use npm install for a more flexible installation that handles inconsistencies
 RUN npm install
 
-# Copy the rest of your application code
+# Copy all your source code into the container
+# This includes the important 'config' directory
 COPY . .
 
-# Build the Strapi admin panel for production
-RUN npm run build
-
-# ---- Production Stage ----
-FROM node:18-alpine
-WORKDIR /opt/app
-
-ENV NODE_ENV=production
-
-COPY --from=builder /opt/app/dist ./dist
-COPY --from=builder /opt/app/node_modules ./node_modules
-COPY --from=builder /opt/app/package.json ./package.json
-COPY --from=builder /opt/app/package-lock.json ./package-lock.json
-
-COPY ./config ./config
-COPY ./database ./database
-COPY ./src ./src
-COPY ./public ./public
-
+# Expose the port
 EXPOSE 1337
 
-CMD ["npm", "run", "start"]
+# The default command to run when the container starts
+CMD ["npm", "run", "develop"]

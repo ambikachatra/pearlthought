@@ -2,7 +2,7 @@
 terraform {
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
+      source  = "hashorp/aws"
       version = "~> 5.0"
     }
   }
@@ -29,13 +29,61 @@ module "vpc" {
   single_nat_gateway = true
 }
 
-# --- 3. Container Registry (ECR) ---
+# --- 3. Security Group Rules ---
+# These rules allow services inside our VPC to communicate with each other.
+resource "aws_security_group_rule" "allow_self_db_access" {
+  type                     = "ingress"
+  from_port                = 5432 # Port for PostgreSQL
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = module.vpc.default_security_group_id
+  source_security_group_id = module.vpc.default_security_group_id
+}
+
+resource "aws_security_group_rule" "allow_self_https_access" {
+  type                     = "ingress"
+  from_port                = 443 # Port for HTTPS (for ECR Endpoints)
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = module.vpc.default_security_group_id
+  source_security_group_id = module.vpc.default_security_group_id
+}
+
+
+# --- 4. VPC Endpoints for Private Connectivity ---
+# Required to allow the ECS task in a private subnet to pull images from ECR.
+resource "aws_vpc_endpoint" "ecr_api" {
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.ecr.api"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = module.vpc.private_subnets
+  security_group_ids  = [module.vpc.default_security_group_id]
+}
+
+resource "aws_vpc_endpoint" "ecr_dkr" {
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.ecr.dkr"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+  subnet_ids          = module.vpc.private_subnets
+  security_group_ids  = [module.vpc.default_security_group_id]
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = module.vpc.private_route_table_ids
+}
+
+# --- 5. Container Registry (ECR) ---
 # Creates a private repository to store your Strapi Docker image.
 resource "aws_ecr_repository" "app" {
   name = "${var.project_name}-repo"
 }
 
-# --- 4. Database (RDS PostgreSQL) ---
+# --- 6. Database (RDS PostgreSQL) ---
 # Creates a managed PostgreSQL database in the private subnets.
 resource "random_password" "db_password" {
   length  = 16
@@ -54,7 +102,7 @@ resource "aws_db_instance" "strapi_db" {
   engine_version       = "16.3"
   instance_class       = "db.t3.micro"
   db_name              = "${replace(var.project_name, "-", "")}db"
-  username             = replace(var.project_name, "-", "") # <-- Corrected line
+  username             = replace(var.project_name, "-", "")
   password             = random_password.db_password.result
   vpc_security_group_ids = [module.vpc.default_security_group_id]
   db_subnet_group_name = aws_db_subnet_group.default.name
@@ -62,7 +110,7 @@ resource "aws_db_instance" "strapi_db" {
   publicly_accessible  = false
 }
 
-# --- 5. Container Orchestration (ECS) ---
+# --- 7. Container Orchestration (ECS) ---
 # Defines the cluster and the blueprint (Task Definition) for our Strapi container.
 resource "aws_ecs_cluster" "main" {
   name = "${var.project_name}-cluster"
@@ -83,6 +131,7 @@ resource "aws_ecs_task_definition" "app" {
       containerPort = 1337
     }]
     environment = [
+      { name = "NODE_ENV", value = "production" },
       { name = "DATABASE_CLIENT", value = "postgres" },
       { name = "DATABASE_HOST", value = aws_db_instance.strapi_db.address },
       { name = "DATABASE_PORT", value = tostring(aws_db_instance.strapi_db.port) },
@@ -103,7 +152,7 @@ resource "aws_ecs_task_definition" "app" {
   }])
 }
 
-# --- 6. Permissions (IAM) ---
+# --- 8. Permissions (IAM) ---
 # Creates a role that allows ECS to pull images and write logs.
 resource "aws_iam_role" "ecs_task_execution_role" {
   name = "${var.project_name}-ecs-execution-role"
@@ -122,7 +171,7 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# --- 7. Networking (Load Balancer) ---
+# --- 9. Networking (Load Balancer) ---
 # Creates a public-facing load balancer to distribute traffic to the container.
 resource "aws_lb" "main" {
   name               = "${var.project_name}-lb"
@@ -139,7 +188,7 @@ resource "aws_lb_target_group" "app" {
   vpc_id      = module.vpc.vpc_id
   target_type = "ip"
   health_check {
-    path = "/_health"
+    path = "/" # Corrected health check path
   }
 }
 
@@ -153,7 +202,7 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# --- 8. Service Deployment (ECS Service) ---
+# --- 10. Service Deployment (ECS Service) ---
 # Launches and maintains our Strapi container on AWS Fargate.
 resource "aws_ecs_service" "main" {
   name            = "${var.project_name}-service"
@@ -172,6 +221,13 @@ resource "aws_ecs_service" "main" {
     container_name   = "${var.project_name}-container"
     container_port   = 1337
   }
+
+  # This dependency ensures the endpoints are created before the service tries to start a task.
+  depends_on = [
+    aws_vpc_endpoint.ecr_api,
+    aws_vpc_endpoint.ecr_dkr,
+    aws_vpc_endpoint.s3
+  ]
 }
 
 # Create a log group for the ECS container
